@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>360° 시야각 및 장애물 차단 시뮬레이션 (수정)</title>
+    <style>
+        /* 전체 화면 캔버스, 배경은 검정 */
+        body { margin: 0; overflow: hidden; background: #000; }
+        #ui { position: absolute; top: 10px; left: 10px; z-index: 10; }
+        #ui button { margin-right: 5px; padding: 5px 10px; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <button id="tool-circle">원</button>
+        <button id="tool-triangle">삼각형</button>
+        <button id="tool-rect">사각형</button>
+    </div>
+    <canvas id="canvas"></canvas>
+    <script>
+        /*
+         * FOV 구현 수학 공식:
+         * - Ray–segment 교차: 2D 선분 교차 공식
+         * - Ray–circle 교차: (D·D)t^2 + 2D·(O–C)t + |O–C|^2 – r^2 = 0
+         *   t = (-b ± sqrt(b^2-4ac)) / 2a (양수 중 최소)
+         */
+
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        let selectedTool = 'circle';  // 기본 툴
+        const objects = [];           // 물체 리스트
+
+        // 플레이어 객체
+        const player = {
+            x: canvas.width / 2,
+            y: canvas.height / 2,
+            radius: 15,
+            fovRadius: 400      // 시야 반경
+        };  
+
+        // 드래그 상태
+        let dragTarget = null, dragOffsetX = 0, dragOffsetY = 0;
+
+        // UI 버튼 이벤트
+        document.getElementById('tool-circle').onclick = () => selectedTool = 'circle';
+        document.getElementById('tool-triangle').onclick = () => selectedTool = 'triangle';
+        document.getElementById('tool-rect').onclick = () => selectedTool = 'rect';
+
+        // 마우스 위치 계산
+        function getMousePos(evt) {
+            const rect = canvas.getBoundingClientRect();
+            return { x: evt.clientX - rect.left, y: evt.clientY - rect.top };
+        }
+
+        // 물체 내부 판정
+        function isInside(obj, x, y) {
+            if (obj.type === 'circle') {
+                return Math.hypot(x - obj.x, y - obj.y) <= obj.radius;
+            } else if (obj.type === 'rect') {
+                return x >= obj.x - obj.w/2 && x <= obj.x + obj.w/2 &&
+                       y >= obj.y - obj.h/2 && y <= obj.y + obj.h/2;
+            } else {
+                const path = new Path2D();
+                const h = obj.size * Math.sqrt(3) / 2;  // 제곱근 사용, 삼각함수 아님
+                path.moveTo(obj.x, obj.y - 2*h/3);
+                path.lineTo(obj.x - obj.size/2, obj.y + h/3);
+                path.lineTo(obj.x + obj.size/2, obj.y + h/3);
+                path.closePath();
+                return ctx.isPointInPath(path, x, y);
+            }
+        }
+
+        // 물체 생성
+        function createObject(type, x, y) {
+            if (type === 'circle')        objects.push({ type, x, y, radius: 20 });
+            else if (type === 'rect')     objects.push({ type, x, y, w: 40, h: 40 });
+            else if (type === 'triangle') objects.push({ type, x, y, size: 40 });
+        }
+
+        // 모든 장애물의 세그먼트 및 원 목록 반환
+        function getAllSegments() {
+            const segs = [];
+            objects.forEach(obj => {
+                if (obj.type === 'rect' || obj.type === 'triangle') {
+                    let pts = [];
+                    if (obj.type === 'rect') {
+                        const hw = obj.w/2, hh = obj.h/2;
+                        pts = [
+                            { x: obj.x - hw, y: obj.y - hh },
+                            { x: obj.x + hw, y: obj.y - hh },
+                            { x: obj.x + hw, y: obj.y + hh },
+                            { x: obj.x - hw, y: obj.y + hh }
+                        ];
+                    } else {
+                        const h = obj.size * Math.sqrt(3) / 2;  // 제곱근 사용, 삼각함수 아님
+                        pts = [
+                            { x: obj.x, y: obj.y - 2*h/3 },
+                            { x: obj.x - obj.size/2, y: obj.y + h/3 },
+                            { x: obj.x + obj.size/2, y: obj.y + h/3 }
+                        ];
+                    }
+                    for (let i = 0; i < pts.length; i++) {
+                        segs.push({ a: pts[i], b: pts[(i+1)%pts.length], type: 'segment' });
+                    }
+                } else {
+                    segs.push({ circle: obj, type: 'circle' });
+                }
+            });
+            return segs;
+        }
+
+        // Ray–segment 교차
+        function intersectSegment(ray, seg) {
+            const x1 = ray.o.x, y1 = ray.o.y;
+            const x2 = ray.o.x + ray.dx, y2 = ray.o.y + ray.dy;  // dx, dy는 삼각함수 결과가 반영된 방향 벡터
+            const x3 = seg.a.x,  y3 = seg.a.y;
+            const x4 = seg.b.x,  y4 = seg.b.y;
+            const denom = (y4 - y3)*(x2 - x1) - (x4 - x3)*(y2 - y1);
+            if (denom === 0) return null;
+            const t = ((x4 - x3)*(y1 - y3) - (y4 - y3)*(x1 - x3)) / denom;
+            const u = ((x2 - x1)*(y1 - y3) - (y2 - y1)*(x1 - x3)) / denom;
+            if (t > 0 && u >= 0 && u <= 1) {
+                return { x: x1 + t*ray.dx, y: y1 + t*ray.dy, param: t };
+            }
+            return null;
+        }
+
+        // Ray–circle 교차
+        function intersectCircle(ray, circle) {
+            const ox = ray.o.x - circle.x;
+            const oy = ray.o.y - circle.y;
+            const b = 2 * (ray.dx * ox + ray.dy * oy);  // dx, dy 반영된 레이 방향
+            const c = ox*ox + oy*oy - circle.radius*circle.radius;
+            const disc = b*b - 4*c;
+            if (disc < 0) return null;
+            const t1 = (-b - Math.sqrt(disc)) / 2;  // sqrt 제곱근
+            if (t1 > 0) return { x: ray.o.x + ray.dx*t1, y: ray.o.y + ray.dy*t1, param: t1 };
+            const t2 = (-b + Math.sqrt(disc)) / 2;
+            if (t2 > 0) return { x: ray.o.x + ray.dx*t2, y: ray.o.y + ray.dy*t2, param: t2 };
+            return null;
+        }
+
+        // 시야 폴리곤 계산
+        function computeFOV() {
+            const segs = getAllSegments();
+            const points = [];
+            const steps = 360;
+            for (let i = 0; i < steps; i++) {
+                const ang = (i / steps) * 2 * Math.PI;  // 각도 계산 (0~2π)
+                // 삼각함수 사용 부분 시작
+                const ray = {
+                    o: { x: player.x, y: player.y },
+                    dx: Math.cos(ang),  // dx: cos(θ), x방향 단위벡터 성분
+                    dy: Math.sin(ang)   // dy: sin(θ), y방향 단위벡터 성분
+                };
+                // 삼각함수 사용 부분 끝
+                let closest = {
+                    x: player.x + ray.dx * player.fovRadius,  // trig 영향: dx 반영된 거리
+                    y: player.y + ray.dy * player.fovRadius,  // trig 영향: dy 반영된 거리
+                    param: player.fovRadius
+                };
+                segs.forEach(item => {
+                    let inter = null;
+                    if (item.type === 'segment') inter = intersectSegment(ray, item);
+                    else inter = intersectCircle(ray, item.circle);
+                    if (inter && inter.param < closest.param) closest = inter;
+                });
+                points.push({ x: closest.x, y: closest.y, ang });
+            }
+            points.sort((a, b) => a.ang - b.ang);
+            return points;
+        }
+
+        // 렌더링
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // 배경
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // 장애물
+            ctx.fillStyle = '#888';
+            objects.forEach(obj => {
+                if (obj.type === 'circle') {
+                    ctx.beginPath();
+                    ctx.arc(obj.x, obj.y, obj.radius, 0, 2*Math.PI);  // Math.PI: 원주율, arc는 trig 사용하지 않음
+                    ctx.fill();
+                } else if (obj.type === 'rect') {
+                    ctx.fillRect(obj.x - obj.w/2, obj.y - obj.h/2, obj.w, obj.h);
+                } else {
+                    const h = obj.size * Math.sqrt(3) / 2;
+                    ctx.beginPath();
+                    ctx.moveTo(obj.x, obj.y - 2*h/3);
+                    ctx.lineTo(obj.x - obj.size/2, obj.y + h/3);
+                    ctx.lineTo(obj.x + obj.size/2, obj.y + h/3);
+                    ctx.closePath();
+                    ctx.fill();
+                }
+            });
+
+            // 시야 폴리곤
+            const poly = computeFOV();
+            ctx.fillStyle = 'rgba(255,255,255,0.3)';
+            ctx.beginPath();
+            ctx.moveTo(poly[0].x, poly[0].y);
+            poly.forEach(p => ctx.lineTo(p.x, p.y));  // 이 부분은 trig 결과로 계산된 poly 좌표 사용
+            ctx.closePath();
+            ctx.fill();
+
+            // 플레이어 표시
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, player.radius, 0, 2*Math.PI);
+            ctx.fill();
+
+            requestAnimationFrame(draw);
+        }
+        draw();
+
+        // 마우스 이벤트: 생성, 이동, 삭제
+        canvas.addEventListener('mousedown', evt => {
+            const { x, y } = getMousePos(evt);
+            if (evt.button === 0) {
+                // 플레이어 드래그
+                if (Math.hypot(x - player.x, y - player.y) <= player.radius) {
+                    dragTarget = player;
+                    dragOffsetX = x - player.x;
+                    dragOffsetY = y - player.y;
+                    return;
+                }
+                // 물체 드래그
+                for (let i = objects.length - 1; i >= 0; i--) {
+                    if (isInside(objects[i], x, y)) {
+                        dragTarget = objects[i];
+                        dragOffsetX = x - objects[i].x;
+                        dragOffsetY = y - objects[i].y;
+                        return;
+                    }
+                }
+                // 생성
+                createObject(selectedTool, x, y);
+            }
+        });
+        canvas.addEventListener('mousemove', evt => {
+            if (dragTarget) {
+                const { x, y } = getMousePos(evt);
+                dragTarget.x = x - dragOffsetX;
+                dragTarget.y = y - dragOffsetY;
+            }
+        });
+        canvas.addEventListener('mouseup', evt => { if (evt.button === 0) dragTarget = null; });
+        canvas.addEventListener('contextmenu', evt => {
+            evt.preventDefault();
+            const { x, y } = getMousePos(evt);
+            for (let i = 0; i < objects.length; i++) {
+                if (isInside(objects[i], x, y)) {
+                    objects.splice(i, 1);
+                    break;
+                }
+            }
+        });
+    </script>
+</body>
+</html>
